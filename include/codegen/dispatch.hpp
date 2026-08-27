@@ -19,11 +19,14 @@
 
 namespace cascade::codegen {
 
-inline void emit_fetch(RegisterFile &regs, const Op &op) {
-  regs.store(op.start, access_ir(regs, op.src_kind, op.src, op.length));
+inline void emit_fetch(RegisterFile &regs, llvm::Module &mod,
+                       const LanePolicy &policy, const Op &op) {
+  regs.store(op.start,
+             access_ir(regs, mod, policy, op.src_kind, op.src, op.length));
 }
 
-inline void emit_reset(RegisterFile &regs, const ShiftPlan &plan,
+inline void emit_reset(RegisterFile &regs, llvm::Module &mod,
+                       const LanePolicy &policy, const ShiftPlan &plan,
                        uint8_t axis) {
   if (axis >= plan.reset_programs.size())
     return;
@@ -33,15 +36,29 @@ inline void emit_reset(RegisterFile &regs, const ShiftPlan &plan,
       regs.store(start + i, regs.constants[start + i]);
   }
   for (const Op &fetch : rp.fetches)
-    emit_fetch(regs, fetch);
+    emit_fetch(regs, mod, policy, fetch);
 }
 
-inline void emit_refresh(RegisterFile &regs, const ShiftPlan &plan,
+inline void emit_refresh(RegisterFile &regs, llvm::Module &mod,
+                         const LanePolicy &policy, const ShiftPlan &plan,
                          uint8_t axis) {
   if (axis >= plan.refresh_programs.size())
     return;
   for (const Op &fetch : plan.refresh_programs[axis])
-    emit_fetch(regs, fetch);
+    emit_fetch(regs, mod, policy, fetch);
+}
+
+// Recompute algebraic nodes' operand slots from their children. Runs at the top
+// of every iteration of `axis`, before the root is read and before any shift --
+// so an algebraic node always reflects whatever its children hold now,
+// including children on outer axes that advanced since last time.
+inline void emit_prefetch(RegisterFile &regs, llvm::Module &mod,
+                          const LanePolicy &policy, const ShiftPlan &plan,
+                          uint8_t axis) {
+  if (axis >= plan.prefetch_programs.size())
+    return;
+  for (const Op &fetch : plan.prefetch_programs[axis])
+    emit_fetch(regs, mod, policy, fetch);
 }
 
 inline void emit_shift(RegisterFile &regs, const ShiftPlan &plan,
@@ -65,6 +82,10 @@ inline void emit_shift(RegisterFile &regs, const ShiftPlan &plan,
   }
 }
 
+// Reading any node's current value: leaves splat, connectors alias, and
+// everything else -- chain or algebraic -- is a combinator over its own tape
+// slots. The old recursive E-kind switch is gone: algebraic nodes now own
+// slots, so access_ir covers them (pycr's dispatch_access).
 inline llvm::Value *emit_value(RegisterFile &regs, llvm::Module &mod,
                                const LanePolicy &policy, const Arena &arena,
                                const ShiftPlan &plan, uint32_t node_id) {
@@ -73,60 +94,8 @@ inline llvm::Value *emit_value(RegisterFile &regs, llvm::Module &mod,
     return splat(policy, arena.leaf(node_id));
   if (is_connector_kind(n.kind))
     return regs.load(plan.node_to_offset[n.slot_a] + n.slot_b);
-  if (is_chain_kind(n.kind))
-    return access_ir(regs, n.kind, plan.node_to_offset[node_id], n.slot_b);
-
-  auto ops = arena.operands(node_id);
-  auto val = [&](std::size_t k) {
-    return emit_value(regs, mod, policy, arena, plan, ops[k]);
-  };
-
-  switch (n.kind) {
-  case Kind::EAdd: {
-    llvm::Value *r = val(0);
-    for (std::size_t k = 1; k < ops.size(); ++k)
-      r = regs.builder.CreateFAdd(r, val(k));
-    return r;
-  }
-  case Kind::EMul: {
-    llvm::Value *r = val(0);
-    for (std::size_t k = 1; k < ops.size(); ++k)
-      r = regs.builder.CreateFMul(r, val(k));
-    return r;
-  }
-  case Kind::EPow:
-    return call_intrinsic(regs.builder, mod, policy, llvm::Intrinsic::pow,
-                          {val(0), val(1)});
-  case Kind::ELog: {
-    llvm::Value *ln_a = call_intrinsic(regs.builder, mod, policy,
-                                       llvm::Intrinsic::log, {val(0)});
-    llvm::Value *ln_b = call_intrinsic(regs.builder, mod, policy,
-                                       llvm::Intrinsic::log, {val(1)});
-    return regs.builder.CreateFDiv(ln_a, ln_b);
-  }
-  case Kind::ESin:
-    return call_intrinsic(regs.builder, mod, policy, llvm::Intrinsic::sin,
-                          {val(0)});
-  case Kind::ECos:
-    return call_intrinsic(regs.builder, mod, policy, llvm::Intrinsic::cos,
-                          {val(0)});
-  case Kind::ETan: {
-    llvm::Value *s = call_intrinsic(regs.builder, mod, policy,
-                                    llvm::Intrinsic::sin, {val(0)});
-    llvm::Value *c = call_intrinsic(regs.builder, mod, policy,
-                                    llvm::Intrinsic::cos, {val(0)});
-    return regs.builder.CreateFDiv(s, c);
-  }
-  case Kind::ECot: {
-    llvm::Value *s = call_intrinsic(regs.builder, mod, policy,
-                                    llvm::Intrinsic::sin, {val(0)});
-    llvm::Value *c = call_intrinsic(regs.builder, mod, policy,
-                                    llvm::Intrinsic::cos, {val(0)});
-    return regs.builder.CreateFDiv(c, s);
-  }
-  default:
-    return nullptr;
-  }
+  return access_ir(regs, mod, policy, n.kind, plan.node_to_offset[node_id],
+                   n.slot_b);
 }
 
 }
