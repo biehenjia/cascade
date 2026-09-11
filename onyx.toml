@@ -1,0 +1,11 @@
+[lsp.cpp]
+
+command = [
+    "/nix/var/nix/profiles/default/bin/nix", 
+    "develop", 
+    ".", 
+    "--command", 
+    "clangd"
+]
+
+
